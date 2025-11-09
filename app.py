@@ -22,10 +22,8 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 # Environment variables
 from dotenv import load_dotenv
 
-# Agent and Tools - CORRECTED
-from langchain.agents import AgentExecutor, create_react_agent
+# Tools - UPDATED to modern approach
 from langchain_core.tools import tool
-from langchain_core.prompts import PromptTemplate
 from langchain_community.chat_message_histories import ChatMessageHistory
 
 # Load environment variables from .env file
@@ -69,42 +67,10 @@ def get_conversation_agent(vectorstore):
     
     tools = [search_documents]
     
-    # Create ReAct prompt template
-    template = """Answer the following questions as best you can. You have access to the following tools:
-
-{tools}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-Begin!
-
-Question: {input}
-Thought: {agent_scratchpad}"""
-
-    prompt = PromptTemplate.from_template(template)
+    # Bind tools to LLM (modern approach)
+    llm_with_tools = llm.bind_tools(tools)
     
-    # Create the ReAct agent
-    agent = create_react_agent(llm, tools, prompt)
-    
-    # Create agent executor
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=tools,
-        verbose=True,
-        handle_parsing_errors=True,
-        max_iterations=3
-    )
-    
-    return agent_executor
+    return llm_with_tools, tools
 
 # Using this folder for storing the uploaded docs
 DATA_DIR = "__data__"
@@ -116,6 +82,7 @@ app = Flask(__name__)
 
 vectorstore = None
 conversation_agent = None
+tools_list = None
 chat_history = []
 rubric_text = ""
 current_session_id = "default_session"
@@ -195,17 +162,17 @@ def home():
 
 @app.route('/process', methods=['POST'])
 def process_documents():
-    global vectorstore, conversation_agent
+    global vectorstore, conversation_agent, tools_list
     pdf_docs = request.files.getlist('pdf_docs')
     raw_text = get_pdf_text(pdf_docs)
     text_chunks = get_text_chunks(raw_text)
     vectorstore = get_vectorstore(text_chunks)
-    conversation_agent = get_conversation_agent(vectorstore)
+    conversation_agent, tools_list = get_conversation_agent(vectorstore)
     return redirect('/chat')
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
-    global vectorstore, conversation_agent, chat_history, current_session_id
+    global vectorstore, conversation_agent, tools_list, chat_history, current_session_id
     
     if request.method == 'POST':
         user_question = request.form['user_question']
@@ -215,13 +182,50 @@ def chat():
                 # Get existing chat history
                 session_history = get_session_history(current_session_id)
                 
-                # Invoke agent with simple input
-                result = conversation_agent.invoke({
-                    "input": user_question
-                })
+                # Create messages with history
+                messages = []
                 
-                # Extract response
-                response_content = result.get('output', str(result))
+                # Add system message
+                messages.append(SystemMessage(
+                    content="You are a helpful assistant that answers questions about uploaded PDF documents. Use the search_documents tool to find relevant information."
+                ))
+                
+                # Add conversation history
+                for msg in session_history.messages:
+                    messages.append(msg)
+                
+                # Add current question
+                messages.append(HumanMessage(content=user_question))
+                
+                # Invoke LLM with tools
+                response = conversation_agent.invoke(messages)
+                
+                # Check if tool calls are needed
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    # Execute tool calls
+                    for tool_call in response.tool_calls:
+                        tool_name = tool_call['name']
+                        tool_args = tool_call['args']
+                        
+                        # Find and execute the tool
+                        for tool in tools_list:
+                            if tool.name == tool_name:
+                                tool_result = tool.invoke(tool_args)
+                                
+                                # Add tool result to messages and get final response
+                                from langchain_core.messages import ToolMessage
+                                messages.append(response)
+                                messages.append(ToolMessage(
+                                    content=str(tool_result),
+                                    tool_call_id=tool_call['id']
+                                ))
+                                
+                                # Get final response
+                                final_response = conversation_agent.invoke(messages)
+                                response_content = final_response.content
+                                break
+                else:
+                    response_content = response.content
                 
                 # Update chat history
                 session_history.add_user_message(user_question)
@@ -231,6 +235,8 @@ def chat():
                 
             except Exception as e:
                 print(f"Error in chat: {e}")
+                import traceback
+                traceback.print_exc()
                 error_msg = f"Sorry, I encountered an error: {str(e)}"
                 session_history = get_session_history(current_session_id)
                 session_history.add_user_message(user_question)
@@ -277,4 +283,4 @@ def extract_text_from_pdf(pdf_file):
     return text
 
 if __name__ == '__main__':
-    app.run(port=8080)
+    app.run(port=8080, debug=True)
