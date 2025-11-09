@@ -9,3 +9,4 @@ dotenv-python
 faiss-cpu
 tiktoken
 gunicorn==21.2.0
+langchain-core

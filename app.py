@@ -1,18 +1,36 @@
+import os
+import re
 
-import os, re
+# Vector store
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+# Google Generative AI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
+
+# Flask
 from flask import Flask, render_template, request, redirect
+
+# PDF processing
 from PyPDF2 import PdfReader
 
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.schema import HumanMessage, SystemMessage
+# Text splitters - CORRECTED
+from langchain_text_splitters import CharacterTextSplitter
 
+# Message schemas - CORRECTED
+from langchain_core.messages import HumanMessage, SystemMessage
+
+# Environment variables
 from dotenv import load_dotenv
-from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+
+# Chains - CORRECTED
+from langchain.chains import create_retrieval_chain
+from langchain.chains.history_aware_retriever import create_history_aware_retriever
 from langchain.chains.combine_documents import create_stuff_documents_chain
+
+# Prompts
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+# Chat history - ALL CORRECTED
 from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -254,4 +272,4 @@ def extract_text_from_pdf(pdf_file):
     return text
 
 if __name__ == '__main__':
-    app.run(port=8080, debug=True)
+    app.run(port=8080)
