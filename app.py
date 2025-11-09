@@ -1,54 +1,106 @@
-# Import necessary libraries
 
-import os,re
+import os, re
 from langchain_community.vectorstores import FAISS
-# from langchain_openai import OpenAIEmbeddings
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
-from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
-from flask import Flask, render_template, request,redirect
+from flask import Flask, render_template, request, redirect
 from PyPDF2 import PdfReader
 
 from langchain.text_splitter import CharacterTextSplitter
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
 from langchain.schema import HumanMessage, SystemMessage
 
 from dotenv import load_dotenv
+from langchain.chains import create_history_aware_retriever, create_retrieval_chain
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Get the key
+# Get the API key
 google_api_key = os.getenv("GOOGLE_API_KEY")
 
-start_greeting = ["hi","hello"]
-end_greeting = ["bye"]
-way_greeting = ["who are you?"]
+# Store for session histories
+store = {}
 
-#Using this folder for storing the uploaded docs. Creates the folder at runtime if not present
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+
+def get_conversation_chain(vectorstore):
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-2.0-flash-exp",
+        google_api_key=google_api_key 
+    )
+    
+    retriever = vectorstore.as_retriever()
+    
+    # Prompt for contextualizing questions based on chat history
+    contextualize_q_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Given a chat history and the latest user question, "
+                   "formulate a standalone question which can be understood "
+                   "without the chat history. Do NOT answer the question, "
+                   "just reformulate it if needed and otherwise return it as is."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+    
+    # Create history-aware retriever
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, contextualize_q_prompt
+    )
+    
+    # Prompt for answering questions
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an assistant for question-answering tasks. "
+                   "Use the following pieces of retrieved context to answer "
+                   "the question. If you don't know the answer, say that you "
+                   "don't know. Keep the answer concise.\n\n{context}"),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ])
+    
+    # Create question-answer chain
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    
+    # Create retrieval chain
+    rag_chain = create_retrieval_chain(
+        history_aware_retriever, question_answer_chain
+    )
+    
+    # Wrap with message history
+    conversational_rag_chain = RunnableWithMessageHistory(
+        rag_chain,
+        get_session_history,
+        input_messages_key="input",
+        history_messages_key="chat_history",
+        output_messages_key="answer",
+    )
+    
+    return conversational_rag_chain
+
+# Using this folder for storing the uploaded docs. Creates the folder at runtime if not present
 DATA_DIR = "__data__"
 if not os.path.exists(DATA_DIR):
     os.makedirs(DATA_DIR)
 
-#Flask App
+# Flask App
 app = Flask(__name__)
 
 vectorstore = None
 conversation_chain = None
 chat_history = []
 rubric_text = ""
+current_session_id = "default_session"  # Add session tracking
 
 googleai_client = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
+    model="gemini-2.0-flash-exp",
     google_api_key=google_api_key 
 )
-
-# class HumanMessage:
-#     def __init__(self,content):
-#         self.content = content
-#     def __repr__(self):
-#         return f'HumanMessage(content={self.content})'
 
 class AIMessage:
     def __init__(self, content):
@@ -59,16 +111,16 @@ class AIMessage:
     
 def get_pdf_text(pdf_docs):
     text = ""
-    pdf_txt = ""
     for pdf in pdf_docs:
-        filename = os.path.join(DATA_DIR,pdf.filename)
+        filename = os.path.join(DATA_DIR, pdf.filename)
         pdf_txt = ""
         pdf_reader = PdfReader(pdf)
         for page in pdf_reader.pages:
-            text += page.extract_text()
-            pdf_txt += page.extract_text()
+            page_text = page.extract_text()
+            text += page_text
+            pdf_txt += page_text
 
-        with (open(filename, "w", encoding="utf-8")) as op_file:
+        with open(filename, "w", encoding="utf-8") as op_file:
             op_file.write(pdf_txt)
 
     return text
@@ -84,30 +136,21 @@ def get_text_chunks(text):
     return chunks
 
 def get_vectorstore(text_chunks):
-    embeddings = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001",
-    google_api_key=google_api_key)
+    embeddings = GoogleGenerativeAIEmbeddings(
+        model="models/embedding-001",
+        google_api_key=google_api_key
+    )
     vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
     return vectorstore
-
-def get_conversation_chain(vectorstore):
-    llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=google_api_key 
-)
-    vc = vectorstore.as_retriever()
-    memory = ConversationBufferMemory(
-        memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory
-    )
-    return conversation_chain
 
 def _grade_essay(essay):
     # Create system message with rubric
     system_message = SystemMessage(
-        content="You are an Edtech bot, you are supposed to carefully grade the essay based on the given rubric and respond in English only. " + rubric_text
+        content=f"""You are an Edtech bot. Grade the essay based on the given rubric and respond in English only. 
+        
+        RUBRIC: {rubric_text}
+        
+        IMPORTANT: Do NOT repeat or restate the rubric in your response. Start directly with your assessment of the essay. Give assessment in less than 100 words."""
     )
     
     # Create user message with essay
@@ -155,14 +198,21 @@ def process_documents():
 
 @app.route('/chat', methods=['GET', 'POST'])
 def chat():
-    global vectorstore, conversation_chain, chat_history
-    msgs = []
+    global vectorstore, conversation_chain, chat_history, current_session_id
     
     if request.method == 'POST':
         user_question = request.form['user_question']
         
-        response = conversation_chain({'question': user_question})
-        chat_history = response['chat_history']
+        if conversation_chain:
+            # Use the new invoke method with session config
+            response = conversation_chain.invoke(
+                {"input": user_question},
+                config={"configurable": {"session_id": current_session_id}}
+            )
+            
+            # Get the chat history from the session store
+            session_history = get_session_history(current_session_id)
+            chat_history = session_history.messages
         
     return render_template('new_chat.html', chat_history=chat_history)
 
@@ -173,20 +223,22 @@ def pdf_chat():
 @app.route('/essay_grading', methods=['GET', 'POST'])
 def essay_grading():
     result = None
+    text = ""
+    
     if request.method == 'POST':
         if request.form.get('essay_rubric', False):
             global rubric_text
             rubric_text = request.form.get('essay_rubric')
-
             return render_template('new_essay_grading.html')
         
-        if len(request.files['file'].filename) > 0:
+        if 'file' in request.files and len(request.files['file'].filename) > 0:
             pdf_file = request.files['file']
             text = extract_text_from_pdf(pdf_file)
             result = _grade_essay(text)
         else:
-            text = request.form.get('essay_text')
-            result = _grade_essay(text)
+            text = request.form.get('essay_text', '')
+            if text:
+                result = _grade_essay(text)
     
     return render_template('new_essay_grading.html', result=result, input_text=text)
 
@@ -197,9 +249,9 @@ def essay_rubric():
 def extract_text_from_pdf(pdf_file):
     pdf_reader = PdfReader(pdf_file)
     text = ''
-    for page_num in range(len(pdf_reader.pages)):
-        text += pdf_reader.pages[page_num].extract_text()
+    for page in pdf_reader.pages:
+        text += page.extract_text()
     return text
 
 if __name__ == '__main__':
-    app.run(port=8080)
+    app.run(port=8080, debug=True)
